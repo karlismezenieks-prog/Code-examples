@@ -1,0 +1,268 @@
+<?php
+// [DROŠĪBA UN AUTORIZĀCIJA]
+// Pieprasa sesijas drošības pārbaudi pirms datu ielādes
+require_once 'security_auth.php';
+
+// [DATUBĀZES KONFIGURĀCIJA]
+// Izmantota PDO (PHP Data Objects) pieeja drošībai pret SQL injekcijām
+$host = 'localhost'; 
+$db   = 'company_archive_erp_sales'; 
+$user = 'db_user_sales'; 
+$pass = 'YOUR_SECURE_PASSWORD'; 
+
+try { 
+    $pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass); 
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) { 
+    die("Kļūda pieslēdzoties DB: " . $e->getMessage()); 
+}
+
+// [IEVADES DATU APSTRĀDE UN VALIDĀCIJA]
+// Noklusēto datumu un filtru stāvokļu definēšana
+$inA_start = $_GET['a_start'] ?? '01.01.2026';
+$inA_end   = $_GET['a_end']   ?? '31.01.2026';
+$inB_start = $_GET['b_start'] ?? '01.12.2025';
+$inB_end   = $_GET['b_end']   ?? '31.12.2025';
+
+$hide_transport = isset($_GET['hide_transport']) ? 1 : 0;
+$hide_cutting   = isset($_GET['hide_cutting']) ? 1 : 0;
+$single_period  = isset($_GET['single_period']) ? 1 : 0;
+
+// Datumu formatēšana datubāzes (Y-m-d) standartam
+function toDbDate($str) {
+    $str = str_replace(',', '.', trim($str));
+    $d = DateTime::createFromFormat('d.m.Y', $str);
+    return $d ? $d->format('Y-m-d') : date('Y-m-d');
+}
+
+$dbA_start = toDbDate($inA_start);
+$dbA_end   = toDbDate($inA_end);
+$dbB_start = toDbDate($inB_start);
+$dbB_end   = toDbDate($inB_end);
+
+// [DATU PARSĒŠANA / REGEX]
+// Gudrais rīks nestrukturētas informācijas apstrādei – izvelk pavadzīmes numuru no brīva teksta
+function extractInvoiceNumber($info) {
+    if (empty($info)) return 'Nezināms';
+    // Meklē specifikus ERP sistēmas prefixus
+    if (preg_match('/((?:PREFIX|EX)\s*\d+)/i', $info, $m)) return $m[1];
+    // Meklē standarta "Dokuments no..." formātu
+    if (preg_match('/([a-zA-Z0-9_-]+)\s+no\s+/i', $info, $m)) return $m[1];
+    // Fallback variants, ja formāts nav atpazīts
+    return mb_substr($info, 0, 20) . '...';
+}
+
+function buildFileName($doc_number, $doc_date) {
+    $dateObj = new DateTime($doc_date);
+    $formattedDate = $dateObj->format('d.m.y'); 
+    return $doc_number . '_' . $formattedDate . '.xml';
+}
+
+// [DINAMISKIE SQL FILTRI]
+// Filtrēšanas loģika pakalpojumu izslēgšanai no peļņas aprēķiniem
+$transportQuery = "(item_name LIKE '%piegād%' OR item_name LIKE '%delivery%' OR item_name LIKE '%transporta izdev%' OR item_name LIKE '%transportation%') AND item_name NOT LIKE '%profils%'";
+$cuttingQuery   = "(item_name LIKE '%grieš%' OR item_name LIKE '%cutting%' OR item_name LIKE '%zāģ%') AND item_name NOT LIKE '%loksne%' AND item_name NOT LIKE '%griest%'";
+
+$extraWhere = "";
+if ($hide_transport) $extraWhere .= " AND NOT ($transportQuery) ";
+if ($hide_cutting)   $extraWhere .= " AND NOT ($cuttingQuery) ";
+
+// [UI DATU SAGATAVOŠANA]
+// Ātrā unikalitāšu ielāde dinamiskajiem filtriem (Select2 dropdowniem)
+$clients_list = $pdo->query("SELECT DISTINCT client_name FROM profit_analysis WHERE client_name != '' ORDER BY client_name")->fetchAll(PDO::FETCH_COLUMN);
+$items_list = $pdo->query("SELECT DISTINCT item_name FROM profit_analysis WHERE item_name != '' ORDER BY item_name")->fetchAll(PDO::FETCH_COLUMN);
+
+// [DATU AGREGĀCIJA]
+// Funkcija kopsavilkumu aprēķināšanai noteiktos periodos
+function getGlobalTotal($pdo, $start, $end, $extra) {
+    $stmt = $pdo->prepare("SELECT SUM(sales_amount) as s, SUM(profit_total) as p FROM profit_analysis WHERE doc_date BETWEEN ? AND ? $extra");
+    $stmt->execute([$start, $end]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+$totalA = getGlobalTotal($pdo, $dbA_start, $dbA_end, $extraWhere);
+$totalB = $single_period ? ['s'=>0, 'p'=>0] : getGlobalTotal($pdo, $dbB_start, $dbB_end, $extraWhere);
+
+// Rentabilitātes aprēķins ar dalīšanas ar nulli aizsardzību
+$rentA = $totalA['s'] > 0 ? ($totalA['p'] / $totalA['s']) * 100 : 0;
+$rentB = $totalB['s'] > 0 ? ($totalB['p'] / $totalB['s']) * 100 : 0;
+
+// [KRUSTENISKĀ ANALĪZE (TREE VIEW) DATU STRUKTURĒŠANA]
+// Sagatavo sarežģītu hierarhisku datu struktūru (Vecāks -> Bērns) frontend attēlošanai
+$grouped_data = [];
+$parent_totals = [];
+$sum_sales = 0; 
+$sum_profit = 0;
+
+$search_clients = $_GET['search_client'] ?? [];
+$search_items   = $_GET['search_item'] ?? [];
+
+// Datu sanitizācija
+if (!is_array($search_clients)) $search_clients = [$search_clients];
+if (!is_array($search_items)) $search_items = [$search_items];
+$search_clients = array_filter($search_clients, fn($v) => trim($v) !== '');
+$search_items   = array_filter($search_items, fn($v) => trim($v) !== '');
+
+if (!empty($search_clients) || !empty($search_items)) {
+    $where_clauses = ["doc_date BETWEEN ? AND ?"];
+    $params = [$dbA_start, $dbA_end];
+
+    // Dinamiska IN klauzulu ģenerēšana PDO parametriem
+    if (!empty($search_clients)) {
+        $inQuery = implode(',', array_fill(0, count($search_clients), '?'));
+        $where_clauses[] = "client_name IN ($inQuery)";
+        $params = array_merge($params, $search_clients);
+    }
+    if (!empty($search_items)) {
+        $inQuery = implode(',', array_fill(0, count($search_items), '?'));
+        $where_clauses[] = "item_name IN ($inQuery)";
+        $params = array_merge($params, $search_items);
+    }
+
+    $where_sql = implode(' AND ', $where_clauses);
+    
+    $sql_cross = "SELECT * FROM profit_analysis WHERE $where_sql ORDER BY doc_date DESC";
+    $stmt_cross = $pdo->prepare($sql_cross);
+    $stmt_cross->execute($params);
+    $raw_results = $stmt_cross->fetchAll(PDO::FETCH_ASSOC);
+
+    // Datu grupēšanas loģika: Dinamiski pārslēdz vecāka/bērna lomas atkarībā no lietotāja meklēšanas kritērijiem
+    foreach ($raw_results as $row) {
+        if (!empty($search_items) && empty($search_clients)) {
+            $parent_key = $row['item_name']; 
+            $child_name = $row['client_name'];
+        } else {
+            $parent_key = $row['client_name']; 
+            $child_name = $row['item_name'];
+        }
+
+        if (!isset($grouped_data[$parent_key])) {
+            $grouped_data[$parent_key] = [];
+            $parent_totals[$parent_key] = ['sales' => 0, 'profit' => 0, 'count' => 0];
+        }
+        
+        $child_data = $row;
+        $child_data['display_name'] = $child_name; 
+        $grouped_data[$parent_key][] = $child_data;
+        
+        // Agregējam datus vecāka līmenī
+        $parent_totals[$parent_key]['sales'] += $row['sales_amount'];
+        $parent_totals[$parent_key]['profit'] += $row['profit_total'];
+        $parent_totals[$parent_key]['count']++;
+        
+        $sum_sales += $row['sales_amount'];
+        $sum_profit += $row['profit_total'];
+    }
+
+    // Sakārtojam vecāku masīvu pēc apgrozījuma dilstošā secībā
+    uasort($parent_totals, function($a, $b) {
+        return $b['sales'] <=> $a['sales'];
+    });
+}
+?>
+
+<!-- [FRONTEND UN UI LOĢIKA] -->
+<!-- HTML struktūra ir saglabāta tīra, izmantojot lokālos CSS stilus PDF un Excel eksporta saderībai -->
+<!DOCTYPE html>
+<html lang="lv">
+<head>
+    <meta charset="UTF-8">
+    <title>Sistēmas Analītikas Panelis</title>
+    <!-- Bibliotēkas UI elementiem un eksportam -->
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <style>
+        /* ... [CSS Stili saglabāti, anonimizējot zīmola krāsas, ja nepieciešams] ... */
+    </style>
+</head>
+<body>
+
+<!-- ... [HTML UI BLOKI SAGLABĀTI] ... -->
+
+<script>
+    // [DOM MANIPULĀCIJA UN CUSTOM SORTING]
+    
+    // GUDRAIS JAVASCRIPT KĀRTOŠANAS (SORTING) SKRIPTS VISĀM TABULĀM
+    // Šis skripts apstrādā gan plakanās (flat) tabulas, gan sarežģītās Tree-View tabulas
+    document.querySelectorAll('th.sortable').forEach(th => {
+        th.addEventListener('click', function() {
+            const table = th.closest('table');
+            const tbody = table.querySelector('tbody');
+            const colIndex = Array.from(th.parentNode.children).indexOf(th);
+            
+            let currentOrder = th.getAttribute('data-order');
+            let order = (currentOrder === 'desc') ? 'asc' : 'desc';
+            
+            table.querySelectorAll('th').forEach(h => h.removeAttribute('data-order'));
+            th.setAttribute('data-order', order);
+
+            const isTree = table.classList.contains('tree-table');
+
+            // Datu normalizācija kārtošanai (izņemot UI simbolus un formatējot datumus/valūtu)
+            const parseValue = (val) => {
+                val = val.replace(/📄|📅/g, '').trim();
+                if (val === '-' || val === '') return -Infinity; 
+                
+                let dateMatch = val.match(/^(\d{2})\.(\d{2})\.(\d{2,4})/);
+                if (dateMatch) {
+                    let y = parseInt(dateMatch[3]);
+                    if (y < 100) y += 2000;
+                    return new Date(y, parseInt(dateMatch[2])-1, parseInt(dateMatch[1])).getTime();
+                }
+                
+                let numVal = val.replace(/\s/g, '').replace('€', '').replace('%', '').trim();
+                if (numVal !== '' && !isNaN(parseFloat(numVal)) && isFinite(numVal)) {
+                    return parseFloat(numVal);
+                }
+                return val.toLowerCase();
+            };
+
+            if (isTree) {
+                // Kārto vecāku (Parent) mezglus
+                let rows = Array.from(tbody.querySelectorAll('tr.tree-parent'));
+                rows.sort((a, b) => {
+                    let v1 = parseValue(a.children[colIndex].textContent);
+                    let v2 = parseValue(b.children[colIndex].textContent);
+                    if (v1 < v2) return order === 'asc' ? -1 : 1;
+                    if (v1 > v2) return order === 'asc' ? 1 : -1;
+                    return 0;
+                });
+                
+                // Kārto bērnu (Child) mezglus ietvaros katram vecākam, saglabājot hierarhiju
+                rows.forEach(parentRow => {
+                    tbody.appendChild(parentRow); 
+                    let groupId = parentRow.getAttribute('data-group');
+                    let children = Array.from(tbody.querySelectorAll('.child-' + groupId));
+                    
+                    children.sort((a, b) => {
+                        let v1 = parseValue(a.children[colIndex].textContent);
+                        let v2 = parseValue(b.children[colIndex].textContent);
+                        if (v1 < v2) return order === 'asc' ? -1 : 1;
+                        if (v1 > v2) return order === 'asc' ? 1 : -1;
+                        return 0;
+                    });
+                    
+                    children.forEach(child => tbody.appendChild(child)); 
+                });
+            } else {
+                // Standarta tabulu kārtošana
+                let rows = Array.from(tbody.querySelectorAll('tr:not(.total-row)'));
+                rows.sort((a, b) => {
+                    let v1 = parseValue(a.children[colIndex].textContent);
+                    let v2 = parseValue(b.children[colIndex].textContent);
+                    if (v1 < v2) return order === 'asc' ? -1 : 1;
+                    if (v1 > v2) return order === 'asc' ? 1 : -1;
+                    return 0;
+                });
+                rows.forEach(row => tbody.appendChild(row));
+            }
+        });
+    });
+</script>
+</body>
+</html>
