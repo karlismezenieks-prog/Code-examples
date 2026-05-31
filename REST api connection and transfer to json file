@@ -1,0 +1,165 @@
+import requests
+import base64
+import json
+import re
+import os
+import traceback
+from datetime import datetime
+
+# ==========================================
+# 1. SISTĒMAS KONFIGURĀCIJA UN DROŠĪBA
+# ==========================================
+# [AUTORIZĀCIJAS DATI] 
+# (Ražošanas vidē šos ieteicams glabāt .env failā)
+USERNAME = "YOUR_API_USERNAME" 
+PASSWORD = "YOUR_API_PASSWORD"
+
+# [FAILU SISTĒMAS CEĻI]
+# Gala JSON faila ģenerēšanas ceļš WEB serverī
+OUTPUT_JSON_PATH = "/home/your_company/public_html/wp-content/webdati/catalog_data.json"
+
+# [ERP API ENDPOINTI]
+# Savienojums ar resursu vadības sistēmas (ERP) mākoņa REST API
+BASE_URL = "https://horizonweb-cloud.visma.lv/REST_WORKSPACE_ID/rest"
+URL_NOMENKLATURA = f"{BASE_URL}/TNdmNomIzvSar/query?limit=9999&columns=N.KODS,N.NOSAUK,MG1.KODS"
+URL_CENAS = f"{BASE_URL}/TdmNCenTabSar/default?limit=9999"
+URL_ATLIKUMI = f"{BASE_URL}/TNdmNatlSL/default?limit=9999"
+
+# [KĻŪDU REĢISTRĀCIJA]
+script_dir = os.path.dirname(os.path.abspath(__file__))
+error_log_path = os.path.join(script_dir, "system_error_log.txt")
+
+# API Autentifikācijas galveņu (Headers) sagatavošana
+auth_string = f"{USERNAME}:{PASSWORD}"
+encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+headers = {
+    "Authorization": f"Basic {encoded_auth}",
+    "Accept": "application/json"
+}
+
+def log_error(msg):
+    """Fiksē kļūdas lokālā žurnālfailā tālākai atkļūdošanai."""
+    with open(error_log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+
+def fetch_data(url):
+    """Universāla funkcija API pieprasījumiem ar kļūdu apstrādi."""
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('collection', {}).get('row', [])
+        return []
+    except Exception as e:
+        log_error(f"API Savienojuma Kļūda: {e}")
+        return []
+
+# ==========================================
+# 2. ETL PROCESS (Extract, Transform, Load)
+# ==========================================
+try:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Inicializēju datu sinhronizāciju...")
+
+    # [EXTRACT] 1. Datu ieguve no ERP sistēmas
+    nom_rows = fetch_data(URL_NOMENKLATURA)
+    cenas_rows = fetch_data(URL_CENAS)
+    atl_rows = fetch_data(URL_ATLIKUMI)
+
+    katalogs = {}
+    valid_kodi = [] # Saraksts ERP sistēmas secības saglabāšanai
+
+    # [TRANSFORM] 2.1. Nomenklatūras datu parsēšana un strukturēšana
+    for row in nom_rows:
+        if 'N' in row and 'KODS' in row['N']:
+            mg1_dati = row['N'].get('MG1', {})
+            grupa = mg1_dati.get('KODS', '')
+            
+            # FILTRS: Apstrādājam tikai mērķa preču grupu ("Cenu_lapa")
+            if grupa == 'Cenu_lapa':
+                kods = row['N']['KODS']
+                nosaukums = row['N'].get('NOSAUK', '')
+                valid_kodi.append(kods)
+                
+                # Regex (Regulārās izteiksmes) izmantošana tehnisko parametru izvilkšanai no brīva teksta
+                virsma = "Nav norādīts"
+                nosaukums_lower = nosaukums.lower()
+                if "anod" in nosaukums_lower: virsma = "Anodēts"
+                elif "neapstrādāts" in nosaukums_lower: virsma = "Neapstrādāts"
+                elif "inox" in nosaukums_lower: virsma = "INOX"
+                else:
+                    ral_match = re.search(r'(ral\s*\d{4}[a-z]?)', nosaukums_lower)
+                    if ral_match: virsma = ral_match.group(1).upper()
+                        
+                garums = ""
+                garums_match = re.search(r'(?:l=)?(\d+(?:[\.,]\d+)?)\s*m\b', nosaukums_lower)
+                if garums_match: garums = f"{garums_match.group(1)} m"
+                
+                katalogs[kods] = {
+                    "kods": kods,
+                    "nosaukums": nosaukums,
+                    "virsmas_apstrade": virsma,
+                    "profila_garums": garums,
+                    "vieniba": "gab.",
+                    "cena_bez_pvn": 0.0,
+                    "atlikums_cipars": 0.0
+                }
+
+    # [TRANSFORM] 2.2. Cenu pievienošana datu modelim
+    for row in cenas_rows:
+        if 'CENA' in row and 'N' in row['CENA']:
+            kods = row['CENA']['N'].get('KODS')
+            if kods in katalogs:
+                cena_raw = row['CENA'].get('CENA')
+                katalogs[kods]['cena_bez_pvn'] = float(cena_raw) if cena_raw is not None else 0.0
+
+    # [TRANSFORM] 2.3. Noliktavas atlikumu pievienošana un summēšana
+    for row in atl_rows:
+        if 'N' in row and 'KODS' in row['N']:
+            kods = row['N']['KODS']
+            if kods in katalogs:
+                if 'VOL' in row['N']:
+                    daudzums_raw = row['N']['VOL'].get('DAUDZ')
+                    if daudzums_raw is not None:
+                        katalogs[kods]['atlikums_cipars'] += float(daudzums_raw)
+                if 'VIEN' in row['N']:
+                    katalogs[kods]['vieniba'] = row['N']['VIEN'].get('KODS', katalogs[kods]['vieniba'])
+
+    # [TRANSFORM] 2.4. Gala formēšana WEB videi
+    gala_dati = []
+    nr = 1
+
+    for kods in valid_kodi:
+        prece = katalogs[kods]
+        # Finanšu aprēķini un noapaļošana (PVN piemērošana)
+        cena_ar = round(prece['cena_bez_pvn'] * 1.21, 2)
+        atl = prece['atlikums_cipars']
+        vieniba = prece['vieniba']
+        
+        # Noliktavas statusa tekstualizācija e-komercijai
+        atl_teksts = f"Ir (~{atl:g} {vieniba})" if atl > 0 else "Nav"
+        
+        gala_dati.append({
+            "nr": nr,
+            "kods": prece['kods'],
+            "bilde": f"/wp-content/REST/api_bildes/catalog/{prece['kods'].replace('/', '_')}.jpg", 
+            "nosaukums": prece['nosaukums'],
+            "virsmas_apstrade": prece['virsmas_apstrade'],
+            "profila_garums": prece['profila_garums'],
+            "vieniba": vieniba,
+            "cena_bez_pvn": f"{prece['cena_bez_pvn']:.2f}",
+            "cena_ar_pvn": f"{cena_ar:.2f}",
+            "aptuvenais_atlikums": atl_teksts,
+            "ir_atlikuma": atl > 0
+        })
+        nr += 1
+
+    # [LOAD] 3. Sinhronizēto datu eksports uz WEB serveri
+    os.makedirs(os.path.dirname(OUTPUT_JSON_PATH), exist_ok=True)
+    with open(OUTPUT_JSON_PATH, 'w', encoding='utf-8') as f:
+        json.dump(gala_dati, f, ensure_ascii=False, indent=4)
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Sinhronizācija pabeigta! Veiksmīgi apstrādātas {len(gala_dati)} preces.")
+
+except Exception as e:
+    log_error(f"KRITISKA KĻŪDA:\n{traceback.format_exc()}")
+    print("Sistēmas kļūda! Pārbaudiet žurnālfailu.")
