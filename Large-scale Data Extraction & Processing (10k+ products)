@@ -1,0 +1,361 @@
+import os
+import json
+import requests
+import pandas as pd
+import urllib.parse
+import re
+import time
+import random
+from bs4 import BeautifulSoup
+
+# ==========================================
+# LOKĀLĀ KONFIGURĀCIJA
+# ==========================================
+WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
+SISO_CSV = os.path.join(WORKING_DIR, "SISO_produkti.csv")
+OUTPUT_BASE_DIR = os.path.join(WORKING_DIR, "arhivs")
+JSON_OUTPUT = os.path.join(OUTPUT_BASE_DIR, "katalogs.json")
+REPORT_CSV = os.path.join(OUTPUT_BASE_DIR, "pilna_atskaite.csv")
+ASHX_BASE = "https://siso.dk/Admin/Public/GetImage.ashx?image="
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://siso.dk/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+# ==========================================
+# 1. DATU IELĀDE (Tikai Lielais SISO fails)
+# ==========================================
+def load_data():
+    products = {}
+    try:
+        if os.path.exists(SISO_CSV):
+            df_siso = pd.read_csv(SISO_CSV, sep=';', dtype=str, encoding='utf-8')
+            for _, row in df_siso.iterrows():
+                sku = str(row.get('Produkta Nr.', '')).strip()
+                siso_name = str(row.get('Apraksts', '')).strip()
+                
+                if not sku or sku == 'nan': continue
+                if not siso_name or siso_name == 'nan': siso_name = "Nezināms"
+
+                products[sku] = {'name': siso_name, 'type': 'standarta_katalogs'}
+                
+    except Exception as e: 
+        print(f"Kļūda ielasot SISO CSV: {e}")
+
+    return products
+
+# ==========================================
+# 2. WEB SCRAPING FUNKCIJAS
+# ==========================================
+def get_product_url(sku):
+    base_sku = sku.rsplit('-', 1)[0] if '-' in sku else sku
+    
+    search_urls = [
+        f"https://siso.dk/products?q={urllib.parse.quote(sku)}",
+        f"https://siso.dk/products?q={urllib.parse.quote(base_sku)}"
+    ]
+    
+    for url in search_urls:
+        try:
+            time.sleep(random.uniform(0.3, 0.5)) 
+            r = session.get(url, timeout=15)
+            if r.status_code == 404: continue
+            r.raise_for_status()
+            
+            if '?q=' not in r.url.lower() and '/products/' in r.url.lower():
+                if len(r.url.split('/')) >= 5: 
+                    return r.url
+                    
+            soup = BeautifulSoup(r.text, 'html.parser')
+            article = soup.find('article', attrs={"data-product-id": sku})
+            if not article:
+                article = soup.find('article', attrs={"data-product-id": base_sku})
+            
+            if article:
+                link = article.find('a', href=True)
+                if link:
+                    return urllib.parse.urljoin("https://siso.dk", link['href'])
+                    
+        except requests.exceptions.RequestException:
+            continue
+            
+    return None
+
+def extract_gallery_from_product_page(product_url):
+    found_files = set()
+    web_desc = "Apraksts nav atrasts"
+    categories = []
+    
+    try:
+        time.sleep(random.uniform(0.3, 0.5))
+        r = session.get(product_url, timeout=15)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        desc_elem = soup.find(attrs={"itemprop": "description"})
+        if desc_elem and desc_elem.find('h1'):
+            web_desc = desc_elem.find('h1').get_text(strip=True)
+
+        for item in soup.find_all('li', class_=lambda c: c and 'breadcrumb' in c):
+            txt = item.get_text(strip=True)
+            if txt: categories.append(txt)
+
+        media_urls = set()
+        for a in soup.find_all('a', href=True): media_urls.add(a['href'])
+        for img in soup.find_all('img'):
+            if img.get('src'): media_urls.add(img['src'])
+            if img.get('data-src'): media_urls.add(img['data-src'])
+
+        for url in media_urls:
+            clean_url = urllib.parse.unquote(url.split('?')[0]) 
+            if '/files/images/ecom/products/' in clean_url.lower():
+                if clean_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    opt_url = f"{ASHX_BASE}{urllib.parse.quote(clean_url, safe='')}&width=1920&format=webp"
+                    fallback_url = urllib.parse.urljoin("https://siso.dk", clean_url)
+                    orig_ext = '.' + clean_url.rsplit('.', 1)[-1]
+                    fname = os.path.basename(clean_url).rsplit('.', 1)[0] + ".webp"
+                    if 'drawings' in clean_url.lower(): fname = f"DRAWING_{fname}"
+                    found_files.add((opt_url, fallback_url, fname, orig_ext))
+                elif clean_url.lower().endswith('.pdf'):
+                    bad_keywords = ['code of conduct', 'iso_', 'terms', 'betingelser', 'fejlfinding', 'vejledning', 'montagevejledning', 'hã¦ngsel', 'hængsel', 'dansk']
+                    if any(bad in clean_url.lower() for bad in bad_keywords): continue 
+                    d_url = urllib.parse.urljoin(product_url, url)
+                    fname = urllib.parse.unquote(os.path.basename(clean_url))
+                    found_files.add((d_url, d_url, fname, '.pdf'))
+
+    except Exception as e:
+        print(f"  [KĻŪDA parsējot lapu]: {e}")
+        
+    return found_files, web_desc, categories
+
+def download_file_with_fallback(opt_url, fallback_url, save_folder, fname, orig_ext):
+    save_path = os.path.join(save_folder, fname)
+    if os.path.exists(save_path): return True, fname
+    try:
+        r = session.get(opt_url, stream=True, timeout=10)
+        if r.status_code == 200 and len(r.content) > 1000:
+            with open(save_path, 'wb') as f: f.write(r.content)
+            return True, fname
+    except: pass
+    
+    if fallback_url and fallback_url != opt_url:
+        fallback_name = fname.replace('.webp', orig_ext)
+        fallback_path = os.path.join(save_folder, fallback_name)
+        if os.path.exists(fallback_path): return True, fallback_name
+        try:
+            r = session.get(fallback_url, stream=True, timeout=10)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(fallback_path, 'wb') as f: f.write(r.content)
+                return True, fallback_name
+        except: pass
+    return False, fname
+
+def create_product_gallery(folder_path, sku, name):
+    php_content = f"""<?php
+define('WP_USE_THEMES', false);
+ini_set('display_errors', 0);
+$drosiba_path = dirname(__FILE__) . '/../drosiba.php';
+if (file_exists($drosiba_path)) {{ require_once($drosiba_path); }} 
+$files = array_diff(scandir('.'), array('.', '..', 'index.php', 'apraksts.txt'));
+?>
+<!DOCTYPE html><html lang="lv"><head><meta charset="UTF-8"><title>SISO: {sku}</title>
+<style>
+    body {{ font-family: sans-serif; background: #f0f0f1; padding: 20px; }}
+    .container {{ max-width: 1000px; margin: auto; background: #fff; padding: 20px; border-radius: 5px; }}
+    .back {{ display: inline-block; margin-bottom: 15px; padding: 8px; background: #2271b1; color: #fff; text-decoration: none; border-radius: 3px; }}
+    .gallery {{ display: flex; flex-wrap: wrap; gap: 15px; }}
+    .card {{ border: 1px solid #ccc; padding: 10px; width: 200px; text-align: center; background: #fff; }}
+    .card img {{ max-width: 100%; max-height: 150px; display: block; margin: 0 auto 10px; object-fit: contain; }}
+    .doc-icon {{ font-size:40px; text-align:center; display:block; margin-bottom:10px; }}
+</style></head><body>
+<div class="container">
+    <a href="../index.php" class="back">⬅ Atpakaļ uz Katalogu</a>
+    <h2>{sku} - {name}</h2><hr>
+    <div class="gallery">
+        <?php foreach($files as $f): ?>
+            <div class="card">
+                <?php if(preg_match('/\\.(jpg|png|webp)$/i', $f)): ?>
+                    <a href="<?= htmlspecialchars($f) ?>" target="_blank"><img src="<?= htmlspecialchars($f) ?>"></a>
+                <?php else: ?>
+                    <span class="doc-icon">📄</span>
+                <?php endif; ?>
+                <a href="<?= htmlspecialchars($f) ?>" target="_blank" style="word-break: break-all; font-size: 13px;"><?= htmlspecialchars($f) ?></a>
+            </div>
+        <?php endforeach; ?>
+    </div>
+</div></body></html>"""
+    try:
+        path = os.path.join(folder_path, 'index.php')
+        with open(path, 'w', encoding='utf-8') as f: f.write(php_content)
+    except: pass
+
+# ==========================================
+# 3. KONTROLIERIS
+# ==========================================
+def process_single_sku(sku, data):
+    name = data['name']
+    
+    product_folder = os.path.join(OUTPUT_BASE_DIR, sku)
+    os.makedirs(product_folder, exist_ok=True)
+    apraksts_path = os.path.join(product_folder, 'apraksts.txt')
+    archive_link = f"/wp-content/SISO_archive/{sku}/index.php"
+
+    print(f"\n> Apstrādājam: {sku}")
+    urls_to_download = set() 
+    web_desc = "Apraksts nav atrasts"
+    categories = []
+    
+    found_url = get_product_url(sku)
+    
+    if found_url:
+        print(f"  [LAPA] Atrasta: {found_url}")
+        urls_to_download, web_desc, categories = extract_gallery_from_product_page(found_url)
+    else:
+        print("  [X] Produkta lapa netika atrasta Siso sistēmā.")
+
+    downloaded_count = 0
+    pdf_count = 0
+
+    if urls_to_download:
+        for opt_url, fallback_url, fname, orig_ext in urls_to_download:
+            save_path = os.path.join(product_folder, fname)
+            fallback_path = os.path.join(product_folder, fname.replace('.webp', orig_ext))
+            
+            if os.path.exists(save_path) or os.path.exists(fallback_path):
+                if '.pdf' in fname.lower(): pdf_count += 1
+                else: downloaded_count += 1
+                continue
+                
+            time.sleep(random.uniform(0.3, 0.5))
+            success, final_name = download_file_with_fallback(opt_url, fallback_url, product_folder, fname, orig_ext)
+            if success:
+                print(f"    [+] Saglabāts: {final_name}")
+                if '.pdf' in final_name.lower(): pdf_count += 1
+                else: downloaded_count += 1
+
+    create_product_gallery(product_folder, sku, name)
+    
+    with open(apraksts_path, 'w', encoding='utf-8') as f:
+        f.write(f"SKU: {sku}\nNosaukums: {name}\n\nWeb Apraksts:\n{web_desc}")
+        
+    cat_string = " > ".join(categories) if categories else "Standarta katalogs"
+    
+    json_data = {
+        "sku": sku,
+        "name": name,
+        "category": cat_string,
+        "archive_link": archive_link,
+        "type": data['type'],
+        "weight": "0.00", 
+        "price": "0.00"
+    }
+    
+    report_data = {
+        "Kods": sku,
+        "Nosaukums": name,
+        "Kategorija": cat_string,
+        "Lapas_URL": found_url if found_url else "Nav atrasts",
+        "Bildes_skaits": downloaded_count,
+        "PDF_skaits": pdf_count
+    }
+    
+    return json_data, report_data
+
+def main():
+    print("=== SĀKAM LOKĀLO DATU BĀZES BŪVĒŠANU ===")
+    os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+    
+    products = load_data()
+    sku_list = list(products.keys())
+    
+    if not sku_list:
+        print("⚠️ Kļūda: Nav atrasti CSV faili!")
+        return
+        
+    total_found = len(sku_list)
+    print(f"Kopā atrasti {total_found} unikāli kodi PIM failā.")
+
+    # ==========================================
+    # PORCIJU (BATCHING) KONTROLE (Pa 3000 vai cik vajag)
+    # ==========================================
+    START_INDEX = 5500
+    END_INDEX = 7000  # Šobrīd uzlikts no 1000 līdz 4000
+    
+    sku_list_batch = sku_list[START_INDEX:END_INDEX]
+    total_skus = len(sku_list_batch)
+    
+    print(f"⬇️ Apstrādāsim porciju no indeksa {START_INDEX} līdz {END_INDEX} (Kopā: {total_skus} gab.)")
+    
+    frontend_data = []
+    report_data_list = []
+    
+    processed_count = 0
+    found_urls_count = 0
+    
+    for sku in sku_list_batch:
+        j_data, r_data = process_single_sku(sku, products[sku])
+        frontend_data.append(j_data)
+        report_data_list.append(r_data)
+        
+        processed_count += 1
+        if r_data["Lapas_URL"] != "Nav atrasts":
+            found_urls_count += 1
+            
+        if processed_count % 20 == 0 or processed_count == total_skus:
+            # 💥 JAUNIE APRĒĶINI 💥
+            overall_percent = (processed_count / total_skus) * 100
+            found_percent = (found_urls_count / processed_count) * 100 if processed_count > 0 else 0
+            
+            print(f"\n" + "="*55)
+            print(f" 📊 KOPĒJAIS PROGRESS: {processed_count} / {total_skus} apstrādāti ({overall_percent:.1f}%)")
+            print(f" 🔗 ATRASTAS LAPAS: {found_urls_count} no {processed_count} ({found_percent:.1f}% panākumi)")
+            print("="*55 + "\n")
+
+    batch_suffix = f"_{START_INDEX}_{END_INDEX}"
+    batch_json = JSON_OUTPUT.replace(".json", f"{batch_suffix}.json")
+    batch_csv = REPORT_CSV.replace(".csv", f"{batch_suffix}.csv")
+
+    if frontend_data:
+        with open(batch_json, 'w', encoding='utf-8') as f:
+            json.dump(frontend_data, f, ensure_ascii=False, indent=4)
+        print(f"\n[OK] Porcijas JSON sagenerēts: {batch_json}")
+
+    if report_data_list:
+        df_report = pd.DataFrame(report_data_list)
+        df_report.to_csv(batch_csv, index=False, encoding='utf-8-sig', sep=';')
+        print(f"[OK] Porcijas CSV Atskaite sagenerēta: {batch_csv}")
+
+    main_php_path = os.path.join(OUTPUT_BASE_DIR, "index.php")
+    main_php_content = """<?php
+define('WP_USE_THEMES', false);
+ini_set('display_errors', 0);
+?>
+<!DOCTYPE html><html lang="lv"><head><meta charset="UTF-8"><title>SISO Arhīvs</title>
+<style>
+    body { font-family: sans-serif; background: #f0f0f1; padding: 20px; }
+    .container { max-width: 1000px; margin: auto; background: #fff; padding: 20px; border-radius: 5px; }
+    a { display: inline-block; padding: 5px 10px; margin: 5px; background: #e0e0e0; text-decoration: none; color: #333; border-radius: 3px; }
+    a:hover { background: #2271b1; color: #fff; }
+</style></head><body>
+<div class="container">
+    <h2>SISO Produktu Arhīvs</h2><hr>
+    <div>
+        <?php
+        $dirs = array_filter(glob('*'), 'is_dir');
+        foreach($dirs as $dir) {
+            echo "<a href='" . htmlspecialchars($dir) . "/index.php'>" . htmlspecialchars($dir) . "</a>";
+        }
+        ?>
+    </div>
+</div></body></html>"""
+    
+    with open(main_php_path, 'w', encoding='utf-8') as f:
+        f.write(main_php_content)
+    print("=== BATCH PABEIGTS! ===")
+
+if __name__ == "__main__":
+    main()
